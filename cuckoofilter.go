@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"sync"
 )
 
 // maxCuckooKickouts is the maximum number of times reinsert
@@ -17,6 +18,7 @@ type Filter struct {
 	// Bit mask set to len(buckets) - 1. As len(buckets) is always a power of 2,
 	// applying this mask mimics the operation x % len(buckets).
 	bucketIndexMask uint
+	lock            sync.RWMutex
 }
 
 // NewFilter returns a new cuckoofilter suitable for the given number of elements.
@@ -36,22 +38,35 @@ func NewFilter(numElements uint) *Filter {
 		buckets:         buckets,
 		count:           0,
 		bucketIndexMask: uint(len(buckets) - 1),
+		lock:            sync.RWMutex{},
 	}
 }
 
 // Lookup returns true if data is in the filter.
 func (cf *Filter) Lookup(data []byte) bool {
 	i1, fp := getIndexAndFingerprint(data, cf.bucketIndexMask)
+
+	cf.lock.RLock()
 	if b := cf.buckets[i1]; b.contains(fp) {
+		cf.lock.RUnlock()
 		return true
 	}
+	cf.lock.RUnlock()
+
 	i2 := getAltIndex(fp, i1, cf.bucketIndexMask)
+
+	cf.lock.RLock()
+	defer cf.lock.RUnlock()
+
 	b := cf.buckets[i2]
 	return b.contains(fp)
 }
 
 // Reset removes all items from the filter, setting count to 0.
 func (cf *Filter) Reset() {
+	cf.lock.Lock()
+	defer cf.lock.Unlock()
+
 	for i := range cf.buckets {
 		cf.buckets[i].reset()
 	}
@@ -75,6 +90,17 @@ func (cf *Filter) Insert(data []byte) bool {
 }
 
 func (cf *Filter) insert(fp fingerprint, i uint) bool {
+	cf.lock.Lock()
+	defer cf.lock.Unlock()
+
+	if cf.buckets[i].insert(fp) {
+		cf.count++
+		return true
+	}
+	return false
+}
+
+func (cf *Filter) insertLockFree(fp fingerprint, i uint) bool {
 	if cf.buckets[i].insert(fp) {
 		cf.count++
 		return true
@@ -83,6 +109,9 @@ func (cf *Filter) insert(fp fingerprint, i uint) bool {
 }
 
 func (cf *Filter) reinsert(fp fingerprint, i uint) bool {
+	cf.lock.Lock()
+	defer cf.lock.Unlock()
+
 	for k := 0; k < maxCuckooKickouts; k++ {
 		j := rand.Intn(bucketSize)
 		// Swap fingerprint with bucket entry.
@@ -90,7 +119,7 @@ func (cf *Filter) reinsert(fp fingerprint, i uint) bool {
 
 		// Move kicked out fingerprint to alternate location.
 		i = getAltIndex(fp, i, cf.bucketIndexMask)
-		if cf.insert(fp, i) {
+		if cf.insertLockFree(fp, i) {
 			return true
 		}
 	}
@@ -105,6 +134,9 @@ func (cf *Filter) Delete(data []byte) bool {
 }
 
 func (cf *Filter) delete(fp fingerprint, i uint) bool {
+	cf.lock.Lock()
+	defer cf.lock.Unlock()
+
 	if cf.buckets[i].delete(fp) {
 		cf.count--
 		return true
@@ -114,11 +146,17 @@ func (cf *Filter) delete(fp fingerprint, i uint) bool {
 
 // Count returns the number of items in the filter.
 func (cf *Filter) Count() uint {
+	cf.lock.RLock()
+	defer cf.lock.RUnlock()
+
 	return cf.count
 }
 
 // LoadFactor returns the fraction slots that are occupied.
 func (cf *Filter) LoadFactor() float64 {
+	cf.lock.RLock()
+	defer cf.lock.RUnlock()
+
 	return float64(cf.count) / float64(len(cf.buckets)*bucketSize)
 }
 
